@@ -1,12 +1,7 @@
 // src/components/InvoiceUploader.tsx
 import React, { useState, ChangeEvent } from 'react';
 import axios from 'axios';
-
-interface InvoiceData {
-  vendor: string;
-  amount: string;
-  date: string;
-}
+import InvoiceViewer, { InvoiceData } from './InvoiceViewer';
 
 const InvoiceUploader: React.FC = () => {
   const [file, setFile] = useState<File | null>(null);
@@ -14,8 +9,8 @@ const InvoiceUploader: React.FC = () => {
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Adjust to your server's address. If running on the same machine, "http://localhost:5000" often works.
-  const API_URL = process.env.REACT_APP_API_URL || 'http://192.168.0.105:5000';
+  // Adjust to your server's address
+  const API_URL = 'http://localhost:5000';
 
   const handleFileChange = (e: ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
@@ -50,24 +45,18 @@ const InvoiceUploader: React.FC = () => {
   };
 
   return (
-    <div style={{ margin: '2rem' }}>
+    <div style={{ margin: '2rem', fontFamily: 'Arial, sans-serif' }}>
       <h2>Upload an Invoice</h2>
       <input type="file" onChange={handleFileChange} accept="image/*,.pdf" />
-      <button onClick={handleUpload} disabled={loading}>
+      <button onClick={handleUpload} disabled={loading} style={{ marginLeft: '1rem' }}>
         {loading ? 'Processing...' : 'Upload & Process'}
       </button>
 
       {error && <p style={{ color: 'red' }}>{error}</p>}
 
       {extractedData && (
-        <div>
-          <h3>Extracted Invoice Data:</h3>
-          <p><strong>Vendor:</strong> {extractedData.vendor}</p>
-          <p><strong>Date:</strong> {extractedData.date}</p>
-          <p><strong>Amount:</strong> {extractedData.amount}</p>
-          <pre style={{ backgroundColor: '#f4f4f4', padding: '1rem' }}>
-            {JSON.stringify(extractedData, null, 2)}
-          </pre>
+        <div style={{ marginTop: '2rem' }}>
+          <InvoiceViewer data={extractedData} />
         </div>
       )}
     </div>
