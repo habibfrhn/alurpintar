@@ -1,14 +1,21 @@
 // backend/src/server.ts
+import 'dotenv/config';
 import express, { Request, Response } from 'express';
 import multer from 'multer';
 import cors from 'cors';
-import Tesseract from 'tesseract.js';
 import path from 'path';
 import fs from 'fs';
-import sharp from 'sharp';
+import {
+  TextractClient,
+  AnalyzeDocumentCommand,
+  FeatureType,
+  AnalyzeDocumentCommandOutput,
+  Block,
+} from '@aws-sdk/client-textract';
 
 const app = express();
 app.use(cors());
+app.use(express.json());
 
 // Ensure the "uploads" directory exists
 const uploadsDir = path.join(__dirname, '..', 'uploads');
@@ -16,307 +23,259 @@ if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
-// Multer config
+// Serve static files from the uploads folder
+app.use('/uploads', express.static(uploadsDir));
+
+// Configure Multer to store uploaded files in the "uploads" directory
 const upload = multer({ dest: uploadsDir });
 
-// Optional test endpoint
-app.get('/api/test', (req: Request, res: Response) => {
+// Initialize Textract client using environment variables
+const textractClient = new TextractClient({
+  region: process.env.AWS_REGION || 'us-east-1',
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID || '',
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
+  },
+});
+
+// In-memory "databank" for invoices
+interface Invoice {
+  id: string;
+  fileName: string;
+  filePath: string;
+  imageUrl: string;
+  sellerName: string;
+  buyerName: string;
+  buyerAddress: string;
+  transactionNumber: string;
+  invoiceDate: string;
+  dueDate: string;
+  taxAmount: string;
+  amountPaid: string;
+}
+let invoices: Invoice[] = [];
+
+// Test endpoint
+app.get('/api/test', (req: Request, res: Response): void => {
   res.json({ status: 'ok' });
 });
 
 /**
  * POST /api/upload
+ * Uploads an invoice, sends it to Amazon Textract for analysis,
+ * and returns:
+ *   - lines[] (raw lines of text)
+ *   - keyValue{} (parsed key-value pairs)
+ *   - fileUrl (URL for the uploaded image/PDF)
  */
-app.post('/api/upload', upload.single('invoice'), async (req: Request, res: Response): Promise<void> => {
-  console.log('Received upload request.');
-  if (!req.file) {
-    res.status(400).json({ error: 'No file uploaded' });
-    return;
+app.post(
+  '/api/upload',
+  upload.single('invoice'),
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      console.log('Received /api/upload request.');
+      if (!req.file) {
+        res.status(400).json({ error: 'No file uploaded' });
+        return;
+      }
+      const filePath = req.file.path;
+      const fileBytes = fs.readFileSync(filePath);
+
+      const params = {
+        Document: { Bytes: fileBytes },
+        FeatureTypes: [FeatureType.FORMS, FeatureType.TABLES],
+      };
+
+      const command = new AnalyzeDocumentCommand(params);
+      const response = await textractClient.send(command);
+
+      const PORT = process.env.PORT || 5000;
+      const fileUrl = `http://localhost:${PORT}/uploads/${req.file.filename}`;
+
+      // 1) Extract raw lines
+      const linesArray = extractLinesFromAnalyzeDocument(response);
+
+      // 2) Extract key-value pairs
+      const keyValuePairs = extractKeyValuePairsFromAnalyzeDocument(response);
+
+      // Log them in the server console for debugging
+      console.log('Extracted lines:', linesArray);
+      console.log('Extracted key-value pairs:', keyValuePairs);
+
+      res.json({ lines: linesArray, keyValue: keyValuePairs, fileUrl });
+    } catch (error) {
+      console.error('Error during processing:', error);
+      res.status(500).json({ error: 'Processing failed' });
+    }
+  }
+);
+
+/**
+ * Helper function to extract lines from the Textract response.
+ */
+function extractLinesFromAnalyzeDocument(
+  response: AnalyzeDocumentCommandOutput
+): string[] {
+  if (!response || !response.Blocks) return [];
+  const lines: string[] = [];
+  for (const block of response.Blocks) {
+    if (block.BlockType === 'LINE' && block.Text) {
+      lines.push(block.Text);
+    }
+  }
+  return lines;
+}
+
+/**
+ * Helper function to extract key-value pairs from the Textract response.
+ */
+function extractKeyValuePairsFromAnalyzeDocument(
+  response: AnalyzeDocumentCommandOutput
+): Record<string, string> {
+  if (!response || !response.Blocks) return {};
+
+  const blocks = response.Blocks;
+  // Create a map of blockId -> block
+  const blockMap = new Map<string, Block>();
+  for (const b of blocks) {
+    if (b.Id) {
+      blockMap.set(b.Id, b);
+    }
   }
 
-  try {
-    // 1) Preprocess image with Sharp
-    const originalFilePath = req.file.path;
-    const processedFilePath = path.join(uploadsDir, `processed_${req.file.filename}.png`);
-    await sharp(originalFilePath)
-      .grayscale()
-      .normalize()
-      .toFile(processedFilePath);
-    fs.unlinkSync(originalFilePath);
+  const keyValue: Record<string, string> = {};
 
-    // 2) Tesseract OCR
-    const { data: { text } } = await Tesseract.recognize(processedFilePath, 'eng');
-    fs.unlinkSync(processedFilePath);
+  for (const block of blocks) {
+    // Check if block is a KEY and has relationships
+    if (
+      block.BlockType === 'KEY_VALUE_SET' &&
+      block.EntityTypes?.includes('KEY') &&
+      block.Relationships
+    ) {
+      let keyText = '';
+      let valueText = '';
 
-    console.log('=== RAW OCR TEXT START ===');
-    console.log(text);
-    console.log('=== RAW OCR TEXT END ===');
+      // 1) Extract key text from child relationships
+      const childRel = block.Relationships.find((r) => r.Type === 'CHILD');
+      if (childRel?.Ids) {
+        for (const cid of childRel.Ids) {
+          const childBlock = blockMap.get(cid);
+          if (childBlock?.Text) {
+            keyText += childBlock.Text + ' ';
+          }
+        }
+        keyText = keyText.trim();
+      }
 
-    // 3) Clean & parse
-    const cleanedText = cleanOcrText(text);
-    const invoiceData = parseInvoice(cleanedText);
+      // 2) Find VALUE block
+      const valueRel = block.Relationships.find((r) => r.Type === 'VALUE');
+      if (valueRel?.Ids && valueRel.Ids.length > 0) {
+        const valueBlock = blockMap.get(valueRel.Ids[0]);
+        if (valueBlock?.BlockType === 'KEY_VALUE_SET' && valueBlock.Relationships) {
+          // 3) Extract the text from the child blocks of the VALUE block
+          const valChildRel = valueBlock.Relationships.find((r) => r.Type === 'CHILD');
+          if (valChildRel?.Ids) {
+            for (const vcid of valChildRel.Ids) {
+              const vchildBlock = blockMap.get(vcid);
+              if (vchildBlock?.Text) {
+                valueText += vchildBlock.Text + ' ';
+              }
+            }
+            valueText = valueText.trim();
+          }
+        }
+      }
 
-    console.log('Extracted Invoice Data:', invoiceData);
-    // 4) Send JSON
-    res.json(invoiceData);
-
-  } catch (error) {
-    console.error('Error during processing:', error);
-    res.status(500).json({ error: 'Processing failed' });
+      if (keyText) {
+        keyValue[keyText] = valueText;
+      }
+    }
   }
+  return keyValue;
+}
+
+/**
+ * POST /api/invoices
+ * Saves an invoice into the databank.
+ * If a file is uploaded, use it; otherwise, assume JSON data (from InvoiceProcesser).
+ */
+app.post(
+  '/api/invoices',
+  upload.single('invoice'),
+  (req: Request, res: Response): void => {
+    try {
+      if (req.file) {
+        // File upload case (if needed)
+        const invoiceId = Date.now().toString();
+        const filePath = req.file.path;
+        const fileName = req.file.originalname;
+        const PORT = process.env.PORT || 5000;
+        const invoice: Invoice = {
+          id: invoiceId,
+          fileName,
+          filePath,
+          imageUrl: `http://localhost:${PORT}/uploads/${req.file.filename}`,
+          sellerName: '',
+          buyerName: '',
+          buyerAddress: '',
+          transactionNumber: '',
+          invoiceDate: '',
+          dueDate: '',
+          taxAmount: '',
+          amountPaid: '',
+        };
+        invoices.push(invoice);
+        res.json({ id: invoiceId });
+      } else {
+        // Processed invoice saved from InvoiceProcesser (sent as JSON)
+        const invoiceData = req.body as Invoice;
+        const invoiceId = Date.now().toString();
+        invoiceData.id = invoiceId;
+        invoices.push(invoiceData);
+        res.json({ id: invoiceId });
+      }
+    } catch (error) {
+      res.status(500).json({ error: 'Error saving invoice' });
+    }
+  }
+);
+
+/**
+ * GET /api/invoices
+ * Returns a list of all uploaded invoices.
+ */
+app.get('/api/invoices', (req: Request, res: Response): void => {
+  res.json(invoices);
 });
 
 /**
- * cleanOcrText:
- *  - We forcibly replace the big merged chunk of text with the exact lines we need.
- *  - This is extremely brittle, but it ensures we get the correct Buyer Name, Address, etc.
+ * GET /api/invoices/:id
+ * Returns details for a specific invoice.
  */
-function cleanOcrText(text: string): string {
-  let cleaned = text;
-
-  // 
-  // 1) If we find the entire block that Tesseract lumps together:
-  //    "BILLTO SHIPTO INVOICE # us-001
-  //     John Smith John Smith INVOICE DATE 110212019
-  //     2 Court Square 3787 Pineview Drive Post
-  //     New York, NY 12210 Cambridge, MA 12210 dz 2122010
-  //     DUE DATE 2610212019"
-  //
-  //    We rewrite it with explicit lines:
-  // 
-  //    "BILL TO
-  //     John Smith
-  //     2 Court Square, New York, NY 12210
-  //     SHIP TO
-  //     John Smith
-  //     3787 Pineview Drive, Cambridge, MA 12210
-  //     INVOICE # us-001
-  //     INVOICE DATE 11/02/2019
-  //     DUE DATE 26/02/2019"
-  //
-  //    (We assume "110212019" => "11/02/2019" and "2610212019" => "26/02/2019" to match your original invoice.)
-  //
-
-  const bigBlockRegex = new RegExp(
-    [
-      'BILLTO SHIPTO INVOICE # us-001\\s*',
-      'John Smith John Smith INVOICE DATE 110212019\\s*',
-      '2 Court Square 3787 Pineview Drive Post\\s*',
-      'New York, NY 12210 Cambridge, MA 12210 dz 2122010\\s*',
-      'DUE DATE 2610212019'
-    ].join(''),
-    'i'
-  );
-
-  cleaned = cleaned.replace(
-    bigBlockRegex,
-    // We rewrite it as the lines we want:
-    [
-      'BILL TO',
-      'John Smith',
-      '2 Court Square, New York, NY 12210',
-      'SHIP TO',
-      'John Smith',
-      '3787 Pineview Drive, Cambridge, MA 12210',
-      'INVOICE # us-001',
-      'INVOICE DATE 11/02/2019',
-      'DUE DATE 26/02/2019'
-    ].join('\n')
-  );
-
-  // 2) If "Sales Tax 6.25% 206", remove " 206" so we can parse the percent
-  cleaned = cleaned.replace(/(Sales Tax\s+\d+\.\d+%\s*)\d+/, '$1');
-
-  // 3) Insert space if "Tax" merges with digits => "Tax9.06" => "Tax 9.06"
-  cleaned = cleaned.replace(/(Tax)(\d)/i, '$1 $2');
-
-  return cleaned;
-}
+app.get('/api/invoices/:id', (req: Request, res: Response): void => {
+  const invoice = invoices.find((inv) => inv.id === req.params.id);
+  if (!invoice) {
+    res.status(404).json({ error: 'Invoice not found' });
+    return;
+  }
+  res.json(invoice);
+});
 
 /**
- * parseInvoice:
- *  - Extracts vendor, buyerName, buyerAddress, shipName, shipAddress, date,
- *    line items, subtotal, tax, total.
+ * PUT /api/invoices/:id
+ * Updates details of a specific invoice.
  */
-function parseInvoice(fullText: string) {
-  const lines = fullText.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-
-  const result = {
-    vendor: 'Not found',
-    buyerName: 'Not found',
-    buyerAddress: 'Not found',
-    shipName: 'Not found',
-    shipAddress: 'Not found',
-    date: 'Not found',
-    lineItems: [] as Array<{
-      description: string;
-      quantity: string;
-      unitPrice: string;
-      lineTotal: string;
-    }>,
-    subtotal: 'Not found',
-    tax: 'Not found',
-    total: 'Not found',
-  };
-
-  // (1) Vendor
-  for (const line of lines) {
-    if (/east\s+repair\s+inc\.?/i.test(line)) {
-      result.vendor = 'East Repair Inc.';
-      break;
-    }
+app.put('/api/invoices/:id', (req: Request, res: Response): void => {
+  const invoice = invoices.find((inv) => inv.id === req.params.id);
+  if (!invoice) {
+    res.status(404).json({ error: 'Invoice not found' });
+    return;
   }
+  Object.assign(invoice, req.body);
+  res.json({ message: 'Invoice updated successfully' });
+});
 
-  // (2) Buyer (Bill To)
-  const billToIndex = lines.findIndex(l => /^bill\s+to$/i.test(l));
-  if (billToIndex !== -1) {
-    const buyerLines: string[] = [];
-    for (let i = billToIndex + 1; i < lines.length; i++) {
-      if (/^ship\s+to$/i.test(lines[i]) || /invoice\s+date/i.test(lines[i]) || /subtotal/i.test(lines[i]) || /tax/i.test(lines[i]) || /total/i.test(lines[i]) || /due\s+date/i.test(lines[i])) {
-        break;
-      }
-      buyerLines.push(lines[i]);
-    }
-    if (buyerLines.length > 0) {
-      result.buyerName = buyerLines[0];
-      if (buyerLines.length > 1) {
-        result.buyerAddress = buyerLines.slice(1).join(', ');
-      }
-    }
-  }
-
-  // (3) Ship To
-  const shipToIndex = lines.findIndex(l => /^ship\s+to$/i.test(l));
-  if (shipToIndex !== -1) {
-    const shipLines: string[] = [];
-    for (let i = shipToIndex + 1; i < lines.length; i++) {
-      if (/^bill\s+to$/i.test(lines[i]) || /invoice\s+date/i.test(lines[i]) || /subtotal/i.test(lines[i]) || /tax/i.test(lines[i]) || /total/i.test(lines[i]) || /due\s+date/i.test(lines[i])) {
-        break;
-      }
-      shipLines.push(lines[i]);
-    }
-    if (shipLines.length > 0) {
-      result.shipName = shipLines[0];
-      if (shipLines.length > 1) {
-        result.shipAddress = shipLines.slice(1).join(', ');
-      }
-    }
-  }
-
-  // (4) Invoice Date: e.g. "INVOICE DATE 11/02/2019"
-  const dateRegex = /invoice\s+date\s+(\d{1,2}\/\d{1,2}\/\d{4})/i;
-  for (const line of lines) {
-    const m = line.match(dateRegex);
-    if (m) {
-      result.date = m[1];
-      break;
-    }
-  }
-
-  // (5) Line Items
-  parseLineItems(lines, result.lineItems);
-
-  // (6) Subtotal
-  for (const line of lines) {
-    const m = line.match(/^subtotal\s+([\d.,]+)/i);
-    if (m) {
-      result.subtotal = fixDecimal(m[1]);
-      break;
-    }
-  }
-
-  // (7) If we see "Sales Tax 6.25%", compute tax from subtotal => 9.06
-  const salesTaxPercentRegex = /sales\s+tax\s+(\d+\.\d+)%/i;
-  for (const line of lines) {
-    const m = line.match(salesTaxPercentRegex);
-    if (m && result.subtotal !== 'Not found') {
-      const percent = parseFloat(m[1]) / 100; // 0.0625
-      const taxVal = parseFloat(result.subtotal) * percent; // => 145 * 0.0625 = 9.0625 => 9.06
-      result.tax = taxVal.toFixed(2);
-      break;
-    }
-  }
-
-  // If not found, parse "Tax 9.06"
-  if (result.tax === 'Not found') {
-    for (const line of lines) {
-      const m = line.match(/^(?:sales\s+tax|tax)\s+([\d.,]+)/i);
-      if (m) {
-        result.tax = fixDecimal(m[1]);
-        break;
-      }
-    }
-  }
-
-  // (8) Total (last occurrence of "TOTAL")
-  const totalMatches = [...fullText.matchAll(/TOTAL\s*[:\-]?\s*\$?([\d.,]+)/gi)];
-  if (totalMatches.length > 0) {
-    const lastMatch = totalMatches[totalMatches.length - 1];
-    result.total = fixDecimal(lastMatch[1]);
-  }
-
-  return result;
-}
-
-/**
- * parseLineItems:
- *  - Looks for lines ending with 2 numeric tokens => unitPrice, lineTotal
- *  - If first token is numeric, treat it as quantity
- *  - Skips lines with address keywords
- */
-function parseLineItems(lines: string[], items: Array<{
-  description: string;
-  quantity: string;
-  unitPrice: string;
-  lineTotal: string;
-}>) {
-  for (const line of lines) {
-    // If it's obviously an address line, skip
-    if (/\bCourt\b|\bSquare\b|\bDrive\b|\bPost\b|\bYork\b|\bCambridge\b|\bdz\b/i.test(line)) {
-      continue;
-    }
-    // Must end with 2 numeric tokens
-    const tokens = line.split(/\s+/);
-    if (tokens.length < 3) continue;
-    const lastToken = tokens[tokens.length - 1];
-    const secondLast = tokens[tokens.length - 2];
-    if (!isNumericToken(lastToken) || !isNumericToken(secondLast)) continue;
-
-    // If first token is integer, that's quantity
-    let quantity = '1';
-    if (/^\d+$/.test(tokens[0])) {
-      quantity = tokens.shift() as string;
-    }
-    const lineTotalRaw = tokens.pop() as string;
-    const unitPriceRaw = tokens.pop() as string;
-    const description = tokens.join(' ');
-
-    items.push({
-      description: description.trim(),
-      quantity,
-      unitPrice: fixDecimal(unitPriceRaw),
-      lineTotal: fixDecimal(lineTotalRaw),
-    });
-  }
-}
-
-/** isNumericToken: e.g. "100.00", "1500" */
-function isNumericToken(str: string): boolean {
-  return /^[\d.,]+$/.test(str);
-}
-
-/** fixDecimal: e.g. "1500" => "15.00" if 3-4 digits */
-function fixDecimal(value: string): string {
-  if (value.includes('.')) return value;
-  if (/^\d{3,4}$/.test(value)) {
-    const intPart = value.slice(0, -2);
-    const decPart = value.slice(-2);
-    return `${intPart}.${decPart}`;
-  }
-  return value;
-}
-
-const PORT = 5000;
-app.listen(PORT, '0.0.0.0', () => {
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, (): void => {
   console.log(`Server running on port ${PORT}`);
 });

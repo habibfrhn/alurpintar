@@ -1,16 +1,16 @@
-// src/components/InvoiceUploader.tsx
+// src/InvoiceUploader.tsx
 import React, { useState, ChangeEvent } from 'react';
 import axios from 'axios';
-import InvoiceViewer, { InvoiceData } from './InvoiceViewer';
+import { useNavigate } from 'react-router-dom';
+import theme from './theme';
 
 const InvoiceUploader: React.FC = () => {
   const [file, setFile] = useState<File | null>(null);
-  const [extractedData, setExtractedData] = useState<InvoiceData | null>(null);
-  const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState<boolean>(false);
+  const navigate = useNavigate();
 
-  // Adjust to your server's address
-  const API_URL = 'http://localhost:5000';
+  const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:5000';
 
   const handleFileChange = (e: ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
@@ -31,13 +31,22 @@ const InvoiceUploader: React.FC = () => {
     formData.append('invoice', file);
 
     try {
-      const res = await axios.post<InvoiceData>(`${API_URL}/api/upload`, formData, {
+      // Call /api/upload to process with Textract
+      const res = await axios.post(`${API_URL}/api/upload`, formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
       });
-      setExtractedData(res.data);
+
+      // We now have { lines, keyValue, fileUrl }
+      const { lines, keyValue, fileUrl } = res.data;
+      
+      // Log for debugging
+      console.log('Textract lines:', lines);
+      console.log('Textract keyValue:', keyValue);
+
+      // Pass them to the next screen
+      navigate('/process', { state: { extraction: lines, fileUrl, keyValue } });
     } catch (err: any) {
-      console.error(err);
-      const message = err.response?.data?.error || err.message || 'Error uploading file. Please try again.';
+      const message = err.response?.data?.error || err.message || 'Error uploading file.';
       setError(message);
     } finally {
       setLoading(false);
@@ -45,20 +54,23 @@ const InvoiceUploader: React.FC = () => {
   };
 
   return (
-    <div style={{ margin: '2rem', fontFamily: 'Arial, sans-serif' }}>
-      <h2>Upload an Invoice</h2>
-      <input type="file" onChange={handleFileChange} accept="image/*,.pdf" />
-      <button onClick={handleUpload} disabled={loading} style={{ marginLeft: '1rem' }}>
+    <div className="max-w-md mx-auto">
+      <h2 className="text-2xl font-bold mb-4">Upload Faktur</h2>
+      <input
+        type="file"
+        onChange={handleFileChange}
+        accept="image/jpeg, image/png, image/tiff, application/pdf"
+        className="mb-4 block"
+      />
+      <button
+        onClick={handleUpload}
+        disabled={loading}
+        className="px-4 py-2 rounded text-white"
+        style={{ backgroundColor: theme.button }}
+      >
         {loading ? 'Processing...' : 'Upload & Process'}
       </button>
-
-      {error && <p style={{ color: 'red' }}>{error}</p>}
-
-      {extractedData && (
-        <div style={{ marginTop: '2rem' }}>
-          <InvoiceViewer data={extractedData} />
-        </div>
-      )}
+      {error && <p className="text-red-500 mt-2">{error}</p>}
     </div>
   );
 };
